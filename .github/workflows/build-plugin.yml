@@ -1,0 +1,30 @@
+# Сборка chathider.so на Ubuntu 20.04 (glibc 2.31) — скачай артефакт, без Docker.
+name: Build chathider.so (old glibc)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths: ['server/**']
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 32-bit build
+        run: sudo apt-get update && sudo apt-get install -y g++-multilib
+
+      - name: Build chathider.so
+        run: |
+          cd server
+          g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++11 \
+            -DLINUX -I. \
+            plugin.cpp lib/raknet/BitStream.cpp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chathider-so
+          path: server/chathider.so

@@ -1,0 +1,18 @@
+# Сборка chathider.so под старый glibc (для серверов без доступа)
+# Использование: docker build -f Dockerfile.build -t chathider-build . && docker run --rm -v "$(pwd):/out" chathider-build
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++-multilib \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . /build/
+
+RUN g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++11 \
+    -DLINUX \
+    -I. \
+    plugin.cpp \
+    lib/raknet/BitStream.cpp
