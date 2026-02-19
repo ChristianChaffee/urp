@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 echo "Building chathider.so..."
 
-g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++11 \
+g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++17 \
     -DLINUX \
     -I. \
     plugin.cpp \

@@ -13,9 +13,12 @@
 #include "../SAMP-API/include/sampapi/sampapi.h"
 #include "../SAMP-API/include/sampapi/0.3.7-R3-1/CChat.h"
 #include "../SAMP-API/include/sampapi/0.3.7-R3-1/CNetGame.h"
+#include "protocol.h"
+
+/* Используем настоящий RakNet::BitStream из оригинального RakNet */
+/* Это оригинальный BitStream из RakNet, используем его напрямую */
 #include "../server/lib/raknet/BitStream.h"
 #include "../server/lib/raknet/raknet.h"
-#include "protocol.h"
 
 using namespace sampapi::v037r3;
 
@@ -184,27 +187,86 @@ void set_keylog_module(void* hMod)
 #endif
 }
 
+// #region agent log - client key send instrumentation
+static void chathider_client_log(const char* location, const char* message, unsigned int vkCode, int step, int ok)
+{
+    const char* path = "f:\\urp\\.cursor\\debug.log";
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    unsigned long ts = GetTickCount();
+    fprintf(
+        f,
+        "{\"id\":\"chathider_client_%lu\",\"timestamp\":%lu,"
+        "\"location\":\"%s\",\"message\":\"%s\","
+        "\"data\":{\"vkCode\":%u,\"step\":%d,\"ok\":%d},"
+        "\"runId\":\"pre-fix\",\"hypothesisId\":\"H1\"}\n",
+        ts, ts, location, message, vkCode, step, ok
+    );
+    fclose(f);
+}
+// #endregion
+
 #if CHATHIDER_KEYLOG_ENABLED
 
-/* RakClient Send — сырой пакет [ID_CHATHIDER, ACTION_KEY_PRESSED, key], как в chandling (сервер хукает Receive) */
+/* 1 = шлём raw [251,key] (GetPacketID hook на сервере). 0 = только RPC (для теста — если raw вызывает "Packet was modified"). */
+#define CHATHIDER_SEND_RAW_PACKET 1
+
+/* Отправка ключа. Максимально близко к тому, как это делает сам SAMP-API / RakNet. */
 static void send_key_to_server(unsigned int vkCode)
 {
+    chathider_client_log("send_key_to_server", "entry", vkCode, 0, 1);
+
     CNetGame* net = RefNetGame();
     if (!net || net->GetState() != CNetGame::GAME_MODE_CONNECTED)
         return;
     void* rak = net->GetRakClient();
     if (!rak) return;
 
-    RakNet::BitStream bs;
-    bs.Write((unsigned char)ID_CHATHIDER);
-    bs.Write((unsigned char)ACTION_KEY_PRESSED);
-    bs.Write((unsigned char)(vkCode & 0xFF));
-
-    typedef bool (__thiscall *SendFn)(void* pThis, void* bitStream, int prio, int reli, int channel);
     void** vtable = *(void***)rak;
+    unsigned char keyByte = (unsigned char)(vkCode & 0xFF);
+
+    RakNet::BitStream bsRpc;
+    bsRpc.Write(keyByte);
+    
+    /* Логируем размер BitStream для отладки */
+    int bsSize = bsRpc.GetNumberOfBytesUsed();
+    chathider_client_log("send_key_to_server", "bs_created", vkCode, bsSize, bsSize > 0 ? 1 : 0);
+
+    /* Сигнатура RPC для RakClient (как в SAMP-API): 
+       RPC(int* uniqueID, BitStream* parameters, PacketPriority priority, PacketReliability reliability, 
+           unsigned orderingChannel, bool shiftTimestamp, NetworkID networkId, BitStream* pReplyFromTarget) */
+    /* В SAMP-API RPC вызывается напрямую через указатель, но у нас только void* rak, поэтому используем vtable */
+    /* Пробуем использовать void версию (в некоторых версиях RakNet RPC возвращает void) */
+    typedef void (__thiscall *RPCFn)(void* pThis, int* rpcId, RakNet::BitStream* bitStream,
+                                     int priority, int reliability,
+                                     unsigned channel, bool shiftTimestamp, unsigned int networkId, RakNet::BitStream* pReplyFromTarget);
+    RPCFn pRPC = (RPCFn)vtable[8];
+    chathider_client_log("send_key_to_server", "before_rpc", vkCode, 1, pRPC != nullptr);
+    if (pRPC)
+    {
+        static int rpc_id = CHATHIDER_RPC_KEY_PRESSED;
+        /* Используем числовые значения: HIGH_PRIORITY=1, RELIABLE=8, networkId=0 (UNASSIGNED), pReplyFromTarget=nullptr */
+        pRPC(rak, &rpc_id, &bsRpc, 1 /* HIGH_PRIORITY */, 8 /* RELIABLE */, 0, false, 0, nullptr);
+        chathider_client_log("send_key_to_server", "after_rpc", vkCode, 2, 1);  /* void - считаем успехом */
+    }
+
+#if CHATHIDER_SEND_RAW_PACKET
+    /* Сырой пакет [251, key] — как в chandling: HIGH_PRIORITY, RELIABLE */
+    RakNet::BitStream bsRaw;
+    bsRaw.Write((unsigned char)ID_KEY_PRESSED);
+    bsRaw.Write(keyByte);
+
+    typedef bool (__thiscall *SendFn)(void* pThis, void* bitStream,
+                                      int priority, int reliability,
+                                      unsigned orderingChannel);
     SendFn pSend = (SendFn)vtable[6];
+    chathider_client_log("send_key_to_server", "before_send_raw", vkCode, 3, pSend != nullptr);
     if (pSend)
-        pSend(rak, &bs, 1, 4, 0);
+    {
+        bool ok = pSend(rak, &bsRaw, HIGH_PRIORITY, RELIABLE, 0);
+        chathider_client_log("send_key_to_server", "after_send_raw", vkCode, 4, ok ? 1 : 0);
+    }
+#endif
 }
 
 static LRESULT CALLBACK lowlevel_keyboard_proc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -215,6 +277,7 @@ static LRESULT CALLBACK lowlevel_keyboard_proc(int nCode, WPARAM wParam, LPARAM 
         if (net && net->GetState() == CNetGame::GAME_MODE_CONNECTED)
         {
             KBDLLHOOKSTRUCT* kbs = (KBDLLHOOKSTRUCT*)lParam;
+            chathider_client_log("lowlevel_keyboard_proc", "WM_KEYUP", (unsigned int)kbs->vkCode, 0, 1);
             send_key_to_server((unsigned int)kbs->vkCode);
         }
     }
