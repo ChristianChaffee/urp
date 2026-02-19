@@ -10,5 +10,6 @@
 #define _chathider_included
 
 native SetChatStatus(playerid, bool:status);
+native GetUserLayout(playerid, string_return[], size = sizeof(string_return));
 
 forward OnUserChangeLayout(playerid, layout[]);

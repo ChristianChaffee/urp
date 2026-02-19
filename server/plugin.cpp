@@ -116,6 +116,17 @@ class Script : public AbstractScript<Script> {
     return ok ? 1 : 0;
   }
 
+  /* Native: GetUserLayout(playerid, string_return[], size = sizeof(string_return)) */
+  cell n_GetUserLayout(cell playerid, cell string_return_addr, cell size) {
+    if (playerid < 0 || playerid >= CHATHIDER_MAX_PLAYERS || size <= 0)
+      return 0;
+    cell *dest = GetPhysAddr(string_return_addr);
+    if (!dest)
+      return 0;
+    SetString(dest, std::string(g_player_layout[playerid]), (std::size_t)size);
+    return 1;
+  }
+
 };
 
 class Plugin : public AbstractPlugin<Plugin, Script> {
@@ -173,6 +184,7 @@ class Plugin : public AbstractPlugin<Plugin, Script> {
     try_patch_receive_vtable();
 
     this->RegisterNative<&Script::n_SetChatStatus>("SetChatStatus");
+    this->RegisterNative<&Script::n_GetUserLayout>("GetUserLayout");
 
     return AbstractPlugin<Plugin, Script>::OnLoad();
   }
