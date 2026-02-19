@@ -1,7 +1,7 @@
 /**
  * chathider.inc
  * Native: SetChatStatus(playerid, bool:status)
- * Пока пустая — резерв для будущей логики скрытия чата
+ * Callback: OnUserChangeLayout(playerid, layout[]) — при смене раскладки клавиатуры на клиенте (layout = "RU", "EN" и т.д.)
  */
 
 #if defined _chathider_included
@@ -10,3 +10,5 @@
 #define _chathider_included
 
 native SetChatStatus(playerid, bool:status);
+
+forward OnUserChangeLayout(playerid, layout[]);

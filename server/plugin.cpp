@@ -52,16 +52,31 @@ static int g_rpc_key_registered = 0;
 
 static CCRakServer *pRakServer = 0;
 
+#define CHATHIDER_MAX_PLAYERS 1000
+static char g_player_layout[CHATHIDER_MAX_PLAYERS][8];
+
+static void invoke_OnUserChangeLayout(int playerid, const char *layout);
+
+static void set_layout_and_invoke(int playerid, unsigned char a, unsigned char b) {
+  if (playerid < 0 || playerid >= CHATHIDER_MAX_PLAYERS) return;
+  g_player_layout[playerid][0] = (char)a;
+  g_player_layout[playerid][1] = (char)b;
+  g_player_layout[playerid][2] = '\0';
+  invoke_OnUserChangeLayout(playerid, g_player_layout[playerid]);
+}
+
 /* Forward declarations */
 static void* GetRakServerHook(void);
 static Packet* hooked_Receive(CCRakServer* srv);
 static unsigned char hooked_GetPacketID(Packet *p);
 static void ChathiderRPCKeyPressed(RPCParameters *p);
+static void ChathiderRPCLayoutChanged(RPCParameters *p);
 static void invoke_OnKeyPressed(int playerid, int key);
 
 class Script : public AbstractScript<Script> {
  public:
   std::shared_ptr<Public> onKeyPressed_;
+  std::shared_ptr<Public> onUserChangeLayout_;
 
   /* SA-MP: FILTERSCRIPT=0 для gamemode, 1 для filterscript. PTL ожидает переменную "true = gamemode". */
   const char *VarIsGamemode() { return "FILTERSCRIPT"; }
@@ -72,14 +87,13 @@ class Script : public AbstractScript<Script> {
   }
 
   bool OnLoad() {
-    /* Создаём Public для Chathider_OnKeyPressed только в gamemode */
     if (IsGamemode()) {
       onKeyPressed_ = MakePublic("Chathider_OnKeyPressed", true);
-      if (onKeyPressed_ && onKeyPressed_->Exists()) {
+      if (onKeyPressed_ && onKeyPressed_->Exists())
         Log("Chathider_OnKeyPressed found in gamemode");
-      } else {
+      else
         Log("Chathider_OnKeyPressed not found in gamemode");
-      }
+      onUserChangeLayout_ = MakePublic("OnUserChangeLayout", true);
     }
     return true;
   }
@@ -227,18 +241,17 @@ class Plugin : public AbstractPlugin<Plugin, Script> {
   void register_rpc_key_pressed(void) {
     if (g_rpc_key_registered || !pRakServer)
       return;
-    
     void **vtable = *(void***)pRakServer;
     if (!vtable)
       return;
-    
     typedef void (*RegisterRPC_t)(void*, int*, void (*)(RPCParameters*));
     RegisterRPC_t reg = (RegisterRPC_t)vtable[RAKSERVER_REGISTER_RPC_INDEX];
     if (!reg)
       return;
-    
-    static int rpc_id = CHATHIDER_RPC_KEY_PRESSED;
-    reg((void*)pRakServer, &rpc_id, ChathiderRPCKeyPressed);
+    static int rpc_key = CHATHIDER_RPC_KEY_PRESSED;
+    reg((void*)pRakServer, &rpc_key, ChathiderRPCKeyPressed);
+    static int rpc_layout = CHATHIDER_RPC_LAYOUT_CHANGED;
+    reg((void*)pRakServer, &rpc_layout, ChathiderRPCLayoutChanged);
     g_rpc_key_registered = 1;
   }
 
@@ -286,6 +299,19 @@ static void invoke_OnKeyPressed(int playerid, int key) {
   });
 }
 
+/* Вызов колбэка OnUserChangeLayout(playerid, layout[]) */
+static void invoke_OnUserChangeLayout(int playerid, const char *layout) {
+  Plugin::EveryScript([playerid, layout](const std::shared_ptr<Script> &script) {
+    if (!script->IsGamemode())
+      return true;
+    if (!script->onUserChangeLayout_)
+      script->onUserChangeLayout_ = script->MakePublic("OnUserChangeLayout", true);
+    if (script->onUserChangeLayout_ && script->onUserChangeLayout_->Exists())
+      script->onUserChangeLayout_->Exec(playerid, layout);
+    return false;
+  });
+}
+
 /* GetRakServer hook */
 static void* GetRakServerHook(void) {
   if (pRakServer != 0)
@@ -326,16 +352,24 @@ static Packet* hooked_Receive(CCRakServer* srv) {
     return 0;
   
   Packet* packet = g_original_Receive(srv);
-  while (packet != 0 && packet->data != 0 && packet->length >= 2) {
+  while (packet != 0 && packet->data != 0) {
     unsigned char id = packet->data[0];
-    if (id != (unsigned char)ID_KEY_PRESSED)
-      return packet;
     int playerid = (int)packet->playerIndex;
-    int key = (int)packet->data[1];
-    invoke_OnKeyPressed(playerid, key);
-    if (g_original_DeallocatePacket)
-      g_original_DeallocatePacket(srv, packet);
-    packet = g_original_Receive(srv);
+    if (id == (unsigned char)ID_LAYOUT_CHANGED && packet->length >= 3) {
+      set_layout_and_invoke(playerid, packet->data[1], packet->data[2]);
+      if (g_original_DeallocatePacket)
+        g_original_DeallocatePacket(srv, packet);
+      packet = g_original_Receive(srv);
+      continue;
+    }
+    if (id == (unsigned char)ID_KEY_PRESSED && packet->length >= 2) {
+      invoke_OnKeyPressed(playerid, (int)packet->data[1]);
+      if (g_original_DeallocatePacket)
+        g_original_DeallocatePacket(srv, packet);
+      packet = g_original_Receive(srv);
+      continue;
+    }
+    return packet;
   }
   return packet;
 }
@@ -352,16 +386,20 @@ static unsigned char hooked_GetPacketID(Packet *p) {
   } else {
     return 0;
   }
-  if (!p || !p->data || p->length < 2)
+  if (!p || !p->data)
     return ret;
-  if (ret == (unsigned char)ID_KEY_PRESSED) {
+  if (ret == (unsigned char)ID_LAYOUT_CHANGED && p->length >= 3) {
+    set_layout_and_invoke((int)p->playerIndex, p->data[1], p->data[2]);
+    return 0xFF;
+  }
+  if (ret == (unsigned char)ID_KEY_PRESSED && p->length >= 2) {
     invoke_OnKeyPressed((int)p->playerIndex, (int)p->data[1]);
     return 0xFF;
   }
   return ret;
 }
 
-/* RPC handler */
+/* RPC handlers */
 static void ChathiderRPCKeyPressed(RPCParameters *p) {
   if (!pRakServer || !p || !p->input || p->numberOfBitsOfData < 8)
     return;
@@ -369,6 +407,15 @@ static void ChathiderRPCKeyPressed(RPCParameters *p) {
   if (playerid < 0)
     return;
   invoke_OnKeyPressed(playerid, (int)p->input[0]);
+}
+
+static void ChathiderRPCLayoutChanged(RPCParameters *p) {
+  if (!pRakServer || !p || !p->input || p->numberOfBitsOfData < 16)
+    return;
+  int playerid = pRakServer->GetIndexFromPlayerID(p->sender);
+  if (playerid < 0)
+    return;
+  set_layout_and_invoke(playerid, p->input[0], p->input[1]);
 }
 
 /* Plugin exports */
