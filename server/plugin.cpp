@@ -54,6 +54,7 @@ static CCRakServer *pRakServer = 0;
 
 #define CHATHIDER_MAX_PLAYERS 1000
 static char g_player_layout[CHATHIDER_MAX_PLAYERS][8];
+static char g_player_afk[CHATHIDER_MAX_PLAYERS];  /* 0 = в игре, 1 = AFK (пауза/свёрнуто) */
 
 static void invoke_OnUserChangeLayout(int playerid, const char *layout);
 
@@ -71,12 +72,17 @@ static Packet* hooked_Receive(CCRakServer* srv);
 static unsigned char hooked_GetPacketID(Packet *p);
 static void ChathiderRPCKeyPressed(RPCParameters *p);
 static void ChathiderRPCLayoutChanged(RPCParameters *p);
+static void ChathiderRPCAFKState(RPCParameters *p);
 static void invoke_OnKeyPressed(int playerid, int key);
+static void invoke_OnPlayerEnterAFK(int playerid);
+static void invoke_OnPlayerExitAFK(int playerid);
 
 class Script : public AbstractScript<Script> {
  public:
   std::shared_ptr<Public> onKeyPressed_;
   std::shared_ptr<Public> onUserChangeLayout_;
+  std::shared_ptr<Public> onPlayerEnterAFK_;
+  std::shared_ptr<Public> onPlayerExitAFK_;
 
   /* SA-MP: FILTERSCRIPT=0 для gamemode, 1 для filterscript. PTL ожидает переменную "true = gamemode". */
   const char *VarIsGamemode() { return "FILTERSCRIPT"; }
@@ -94,6 +100,8 @@ class Script : public AbstractScript<Script> {
       else
         Log("Chathider_OnKeyPressed not found in gamemode");
       onUserChangeLayout_ = MakePublic("OnUserChangeLayout", true);
+      onPlayerEnterAFK_ = MakePublic("OnPlayerEnterAFK", true);
+      onPlayerExitAFK_ = MakePublic("OnPlayerExitAFK", true);
     }
     return true;
   }
@@ -139,6 +147,13 @@ class Script : public AbstractScript<Script> {
       return 0;
     SetString(dest, std::string(g_player_layout[playerid]), (std::size_t)size);
     return 1;
+  }
+
+  /* Native: IsPlayerAFK(playerid) — 1 если игрок в паузе/свернул игру, 0 иначе */
+  cell n_IsPlayerAFK(cell playerid) {
+    if (playerid < 0 || playerid >= CHATHIDER_MAX_PLAYERS)
+      return 0;
+    return (cell)g_player_afk[playerid];
   }
 
 };
@@ -200,6 +215,7 @@ class Plugin : public AbstractPlugin<Plugin, Script> {
     this->RegisterNative<&Script::n_SetChatStatus>("SetChatStatus");
     this->RegisterNative<&Script::n_QuitGameForPlayer>("QuitGameForPlayer");
     this->RegisterNative<&Script::n_GetUserLayout>("GetUserLayout");
+    this->RegisterNative<&Script::n_IsPlayerAFK>("IsPlayerAFK");
 
     return AbstractPlugin<Plugin, Script>::OnLoad();
   }
@@ -279,6 +295,8 @@ class Plugin : public AbstractPlugin<Plugin, Script> {
     reg((void*)pRakServer, &rpc_key, ChathiderRPCKeyPressed);
     static int rpc_layout = CHATHIDER_RPC_LAYOUT_CHANGED;
     reg((void*)pRakServer, &rpc_layout, ChathiderRPCLayoutChanged);
+    static int rpc_afk = CHATHIDER_RPC_AFK_STATE;
+    reg((void*)pRakServer, &rpc_afk, ChathiderRPCAFKState);
     g_rpc_key_registered = 1;
   }
 
@@ -335,6 +353,30 @@ static void invoke_OnUserChangeLayout(int playerid, const char *layout) {
       script->onUserChangeLayout_ = script->MakePublic("OnUserChangeLayout", true);
     if (script->onUserChangeLayout_ && script->onUserChangeLayout_->Exists())
       script->onUserChangeLayout_->Exec(playerid, layout);
+    return false;
+  });
+}
+
+static void invoke_OnPlayerEnterAFK(int playerid) {
+  Plugin::EveryScript([playerid](const std::shared_ptr<Script> &script) {
+    if (!script->IsGamemode())
+      return true;
+    if (!script->onPlayerEnterAFK_)
+      script->onPlayerEnterAFK_ = script->MakePublic("OnPlayerEnterAFK", true);
+    if (script->onPlayerEnterAFK_ && script->onPlayerEnterAFK_->Exists())
+      script->onPlayerEnterAFK_->Exec(playerid);
+    return false;
+  });
+}
+
+static void invoke_OnPlayerExitAFK(int playerid) {
+  Plugin::EveryScript([playerid](const std::shared_ptr<Script> &script) {
+    if (!script->IsGamemode())
+      return true;
+    if (!script->onPlayerExitAFK_)
+      script->onPlayerExitAFK_ = script->MakePublic("OnPlayerExitAFK", true);
+    if (script->onPlayerExitAFK_ && script->onPlayerExitAFK_->Exists())
+      script->onPlayerExitAFK_->Exec(playerid);
     return false;
   });
 }
@@ -396,6 +438,18 @@ static Packet* hooked_Receive(CCRakServer* srv) {
       packet = g_original_Receive(srv);
       continue;
     }
+    if (id == (unsigned char)ID_AFK_STATE && packet->length >= 2) {
+      if (playerid >= 0 && playerid < CHATHIDER_MAX_PLAYERS)
+        g_player_afk[playerid] = (char)packet->data[1];
+      if (packet->data[1])
+        invoke_OnPlayerEnterAFK(playerid);
+      else
+        invoke_OnPlayerExitAFK(playerid);
+      if (g_original_DeallocatePacket)
+        g_original_DeallocatePacket(srv, packet);
+      packet = g_original_Receive(srv);
+      continue;
+    }
     return packet;
   }
   return packet;
@@ -423,6 +477,16 @@ static unsigned char hooked_GetPacketID(Packet *p) {
     invoke_OnKeyPressed((int)p->playerIndex, (int)p->data[1]);
     return 0xFF;
   }
+  if (ret == (unsigned char)ID_AFK_STATE && p->length >= 2) {
+    int pid = (int)p->playerIndex;
+    if (pid >= 0 && pid < CHATHIDER_MAX_PLAYERS)
+      g_player_afk[pid] = (char)p->data[1];
+    if (p->data[1])
+      invoke_OnPlayerEnterAFK(pid);
+    else
+      invoke_OnPlayerExitAFK(pid);
+    return 0xFF;
+  }
   return ret;
 }
 
@@ -443,6 +507,20 @@ static void ChathiderRPCLayoutChanged(RPCParameters *p) {
   if (playerid < 0)
     return;
   set_layout_and_invoke(playerid, p->input[0], p->input[1]);
+}
+
+static void ChathiderRPCAFKState(RPCParameters *p) {
+  if (!pRakServer || !p || !p->input || p->numberOfBitsOfData < 8)
+    return;
+  int playerid = pRakServer->GetIndexFromPlayerID(p->sender);
+  if (playerid < 0)
+    return;
+  if (playerid < CHATHIDER_MAX_PLAYERS)
+    g_player_afk[playerid] = (char)p->input[0];
+  if (p->input[0])
+    invoke_OnPlayerEnterAFK(playerid);
+  else
+    invoke_OnPlayerExitAFK(playerid);
 }
 
 /* Plugin exports */

@@ -232,6 +232,50 @@ static unsigned char g_last_layout[2] = { 0xFF, 0xFF };
 static CRITICAL_SECTION g_layout_cs;
 static volatile long g_layout_poll_stop = 0;
 
+/* AFK: 0 = в игре, 1 = в паузе или свернуто. Отправляем при смене состояния. */
+static int g_last_afk_state = -1;
+static HWND g_game_window = NULL;
+
+static BOOL CALLBACK enum_game_window_cb(HWND hwnd, LPARAM lParam)
+{
+    (void)lParam;
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId())
+    {
+        g_game_window = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Окно процесса (GTA SA) — ищем один раз при первом опросе */
+static HWND get_game_window(void)
+{
+    if (g_game_window != NULL && IsWindow(g_game_window))
+        return g_game_window;
+    g_game_window = NULL;
+    EnumWindows(enum_game_window_cb, 0);
+    return g_game_window;
+}
+
+/* GTA SA 1.0: меню паузы — байт по смещению 0x77CB49 от базы exe. 1 = меню открыто. Проверка через VirtualQuery (GCC не поддерживает __try/__except). */
+static int is_pause_menu_open(void)
+{
+    HMODULE base = GetModuleHandleA(NULL);
+    if (!base)
+        return 0;
+    void* addr = (char*)base + 0x77CB49;
+    MEMORY_BASIC_INFORMATION mbi = { 0 };
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0)
+        return 0;
+    if (mbi.State != MEM_COMMIT || !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+        return 0;
+    return *(unsigned char*)addr != 0;
+}
+
 static void get_layout_bytes(unsigned char* a, unsigned char* b)
 {
     DWORD tid = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
@@ -298,6 +342,52 @@ static void send_layout_to_server(void* rak, void** vtable, unsigned char layout
         pSend(rak, &bsRaw, HIGH_PRIORITY, RELIABLE, 0);
     }
 #endif
+}
+
+static void send_afk_to_server(void* rak, void** vtable, unsigned char state)
+{
+    typedef void (__thiscall *RPCFn)(void* pThis, int* rpcId, RakNet::BitStream* bitStream,
+                                     int priority, int reliability,
+                                     unsigned channel, bool shiftTimestamp, unsigned int networkId, RakNet::BitStream* pReplyFromTarget);
+    typedef bool (__thiscall *SendFn)(void* pThis, void* bitStream,
+                                     int priority, int reliability,
+                                     unsigned orderingChannel);
+    RPCFn pRPC = (RPCFn)vtable[8];
+    SendFn pSend = (SendFn)vtable[6];
+    if (pRPC)
+    {
+        RakNet::BitStream bsRpc;
+        bsRpc.Write(state);
+        static int rpc_afk = CHATHIDER_RPC_AFK_STATE;
+        pRPC(rak, &rpc_afk, &bsRpc, 1, 8, 0, false, 0, nullptr);
+    }
+#if CHATHIDER_SEND_RAW_PACKET
+    if (pSend)
+    {
+        RakNet::BitStream bsRaw;
+        bsRaw.Write((unsigned char)ID_AFK_STATE);
+        bsRaw.Write(state);
+        pSend(rak, &bsRaw, HIGH_PRIORITY, RELIABLE, 0);
+    }
+#endif
+}
+
+static void check_and_send_afk_if_changed(void)
+{
+    CNetGame* net = RefNetGame();
+    if (!net || net->GetState() != CNetGame::GAME_MODE_CONNECTED)
+        return;
+    void* rak = net->GetRakClient();
+    if (!rak) return;
+    HWND gw = get_game_window();
+    if (!gw) return;
+    int is_afk = (GetForegroundWindow() != gw) || is_pause_menu_open();
+    if (is_afk != g_last_afk_state)
+    {
+        g_last_afk_state = is_afk;
+        void** vtable = *(void***)rak;
+        send_afk_to_server(rak, vtable, (unsigned char)(is_afk ? 1 : 0));
+    }
 }
 
 /* Отправка ключа. При смене раскладки сначала шлём пакет раскладки (253 + RPC 222), затем ключ (251 + RPC 220). */
@@ -373,6 +463,7 @@ static DWORD WINAPI layout_poll_thread(LPVOID)
     {
         Sleep(120);
         check_and_send_layout_if_changed();
+        check_and_send_afk_if_changed();
     }
     return 0;
 }

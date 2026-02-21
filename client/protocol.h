@@ -13,6 +13,8 @@ enum ChathiderAction : unsigned char {
 
 #define ID_KEY_PRESSED 251       /* client->server: пакет [251, key] */
 #define ID_LAYOUT_CHANGED 253    /* client->server: пакет [253, layout0, layout1] */
+#define ID_AFK_STATE 254         /* client->server: пакет [254, state] */
 
 #define CHATHIDER_RPC_KEY_PRESSED    220
 #define CHATHIDER_RPC_LAYOUT_CHANGED 222
+#define CHATHIDER_RPC_AFK_STATE      223
