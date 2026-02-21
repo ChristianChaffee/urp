@@ -7,7 +7,8 @@ cd "$(dirname "$0")"
 
 echo "Building chathider.so..."
 
-g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++17 \
+# -static-libstdc++: не требовать GLIBCXX_3.4.29 на сервере (совместимость со старым libstdc++)
+g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++17 -static-libstdc++ \
     -DLINUX \
     -I. \
     plugin.cpp \

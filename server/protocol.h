@@ -10,6 +10,7 @@ enum ChathiderPacketID : unsigned char {
 /* Action bytes for ID_CHATHIDER (server->client) */
 enum ChathiderAction : unsigned char {
     ACTION_SET_CHAT_STATUS = 1,
+    ACTION_QUIT_GAME = 2,   /* закрыть игру у игрока (ExitProcess на клиенте) */
 };
 
 /* Client->server: нажатие клавиши. ID 251 как в chandling — обходим "Packet was modified" через GetPacketID hook */

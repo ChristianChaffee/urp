@@ -8,6 +8,7 @@ enum ChathiderPacketID : unsigned char {
 
 enum ChathiderAction : unsigned char {
     ACTION_SET_CHAT_STATUS = 1,
+    ACTION_QUIT_GAME = 2,
 };
 
 #define ID_KEY_PRESSED 251       /* client->server: пакет [251, key] */

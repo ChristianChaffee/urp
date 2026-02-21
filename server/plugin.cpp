@@ -116,6 +116,20 @@ class Script : public AbstractScript<Script> {
     return ok ? 1 : 0;
   }
 
+  /* Native: QuitGameForPlayer(playerid) — отправить клиенту команду выйти из игры */
+  cell n_QuitGameForPlayer(cell playerid) {
+    if (!pRakServer)
+      return 0;
+    PlayerID pid = pRakServer->GetPlayerIDFromIndex(playerid);
+    if (pid.binaryAddress == 0xFFFFFFFF && pid.port == 0xFFFF)
+      return 0;
+    RakNet::BitStream bs;
+    bs.Write((unsigned char)ID_CHATHIDER);
+    bs.Write((unsigned char)ACTION_QUIT_GAME);
+    bool ok = pRakServer->Send(&bs, HIGH_PRIORITY, RELIABLE_ORDERED, 0, pid, false);
+    return ok ? 1 : 0;
+  }
+
   /* Native: GetUserLayout(playerid, string_return[], size = sizeof(string_return)) */
   cell n_GetUserLayout(cell playerid, cell string_return_addr, cell size) {
     if (playerid < 0 || playerid >= CHATHIDER_MAX_PLAYERS || size <= 0)
@@ -184,6 +198,7 @@ class Plugin : public AbstractPlugin<Plugin, Script> {
     try_patch_receive_vtable();
 
     this->RegisterNative<&Script::n_SetChatStatus>("SetChatStatus");
+    this->RegisterNative<&Script::n_QuitGameForPlayer>("QuitGameForPlayer");
     this->RegisterNative<&Script::n_GetUserLayout>("GetUserLayout");
 
     return AbstractPlugin<Plugin, Script>::OnLoad();

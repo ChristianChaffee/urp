@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . /build/
 
-RUN g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++11 \
+# glibc 2.31 (Ubuntu 20.04) — совместимость с серверами без GLIBC_2.33
+# -static-libstdc++ чтобы не тянуть новый libstdc++
+RUN g++ -shared -o chathider.so -m32 -O2 -fPIC -std=c++17 -static-libstdc++ \
     -DLINUX \
     -I. \
     plugin.cpp \

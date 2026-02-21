@@ -45,6 +45,14 @@ static bool g_HookInstalled = false;
 static volatile long g_ChatVisibleRequested = -1;
 static CRITICAL_SECTION g_ChatVisibleCS;
 
+/* QuitGame: не вызывать ExitProcess из колбэка Receive — иначе процесс зависает. Выход откладываем в отдельный поток. */
+static DWORD WINAPI quit_game_thread(LPVOID)
+{
+    Sleep(150);
+    ExitProcess(0);
+    return 0;
+}
+
 /* CChat, CInput — R3-1 offsets из SAMP-API */
 #define SAMP_R3_RENDER_OFFSET     0x671C0  /* CChat::Render — только чат */
 #define SAMP_R3_SWITCHMODE_OFFSET 0x60B50
@@ -87,20 +95,28 @@ static SampPacket* __fastcall hooked_receive(void* rakClient)
     /* g_OriginalReceive указывает на трамплин (оригинальные 5 байт + JMP) */
     SampPacket* pkt = g_OriginalReceive(rakClient);
 
-    if (pkt && pkt->data && pkt->length >= 3 &&
-        pkt->data[0] == ID_CHATHIDER &&
-        pkt->data[1] == ACTION_SET_CHAT_STATUS)
+    if (pkt && pkt->data && pkt->length >= 2 && pkt->data[0] == ID_CHATHIDER)
     {
-        unsigned char status = pkt->data[2];
-        EnterCriticalSection(&g_ChatVisibleCS);
-        g_ChatVisibleRequested = status ? 1 : 0;
-        LeaveCriticalSection(&g_ChatVisibleCS);
-        if (!status)
+        unsigned char action = pkt->data[1];
+        if (action == ACTION_SET_CHAT_STATUS && pkt->length >= 3)
         {
-            CChat* pChat = RefChat();
-            if (pChat) pChat->m_bRedraw = TRUE; /* форсируем вызов Render в следующем кадре */
+            unsigned char status = pkt->data[2];
+            EnterCriticalSection(&g_ChatVisibleCS);
+            g_ChatVisibleRequested = status ? 1 : 0;
+            LeaveCriticalSection(&g_ChatVisibleCS);
+            if (!status)
+            {
+                CChat* pChat = RefChat();
+                if (pChat) pChat->m_bRedraw = TRUE;
+            }
+            return nullptr;
         }
-        return nullptr; /* съедаем пакет, не передаём в SAMP */
+        if (action == ACTION_QUIT_GAME)
+        {
+            /* Выход не из колбэка Receive — иначе игра сворачивается и зависает */
+            CreateThread(NULL, 0, quit_game_thread, NULL, 0, NULL);
+            return nullptr;
+        }
     }
     return pkt;
 }
